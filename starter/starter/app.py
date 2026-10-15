@@ -8,7 +8,9 @@ EN: This is the M10 starter. GET /api/artists is done as an example;
     and test:  python test_endpoints.py http://localhost:8080
 """
 import os
+import re
 import sqlite3
+from datetime import datetime, timedelta
 
 from flask import Flask, jsonify, request
 
@@ -64,41 +66,140 @@ def get_stages():
 
 @app.get("/api/artists/<int:artist_id>/events")
 def get_artist_events(artist_id):
-    # TODO FI: palauta artistin esiintymiset: event_id, day, stage, starts. Tuntematon id → 404.
-    # TODO EN: return the artist's performances: event_id, day, stage, starts. Unknown id → 404.
-    return jsonify(error="not implemented"), 501
+    conn = get_db()
+    # Tuntematon artisti → 404
+    artist = conn.execute(
+        "SELECT artist_id FROM Artist WHERE artist_id = ?", (artist_id,)
+    ).fetchone()
+    if artist is None:
+        conn.close()
+        return jsonify(error="Artist not found"), 404
+
+    rows = conn.execute("""
+        SELECT e.event_id,
+               d.date AS day,
+               s.name AS stage,
+               e.start_time AS starts
+        FROM Event e
+        JOIN Day d   ON e.day_id = d.day_id
+        JOIN Stage s ON e.stage_id = s.stage_id
+        WHERE e.artist_id = ?
+        ORDER BY e.start_time
+    """, (artist_id,)).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
 
 
 @app.get("/api/timetable")
 def get_timetable():
-    day = request.args.get("day")  # FI: kyselyparametri ?day=2025-07-05 / EN: query parameter
-    # TODO FI: rivit {date, stage, artist, starts, ends} aikajärjestyksessä. Ilman parametria koko ohjelma,
-    #          virheellinen päivämäärä → 400. Parametrisoi kysely!
-    # TODO EN: rows {date, stage, artist, starts, ends} in time order. No parameter → whole program,
-    #          invalid date → 400. Parameterize the query!
-    return jsonify(error="not implemented"), 501
+    day = request.args.get("day")  # kyselyparametri ?day=YYYY-MM-DD
+    conn = get_db()
+
+    if day is not None:
+        # Virheellinen päivämäärämuoto → 400
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+            conn.close()
+            return jsonify(error="Invalid date format. Use YYYY-MM-DD"), 400
+
+        rows = conn.execute("""
+            SELECT d.date,
+                   s.name AS stage,
+                   a.name AS artist,
+                   e.start_time AS starts,
+                   e.end_time   AS ends
+            FROM Event e
+            JOIN Day d   ON e.day_id = d.day_id
+            JOIN Stage s ON e.stage_id = s.stage_id
+            JOIN Artist a ON e.artist_id = a.artist_id
+            WHERE d.date = ?
+            ORDER BY e.start_time
+        """, (day,)).fetchall()
+    else:
+        # Ilman parametria → koko ohjelma
+        rows = conn.execute("""
+            SELECT d.date,
+                   s.name AS stage,
+                   a.name AS artist,
+                   e.start_time AS starts,
+                   e.end_time   AS ends
+            FROM Event e
+            JOIN Day d   ON e.day_id = d.day_id
+            JOIN Stage s ON e.stage_id = s.stage_id
+            JOIN Artist a ON e.artist_id = a.artist_id
+            ORDER BY d.date, e.start_time
+        """).fetchall()
+
+    conn.close()
+    return jsonify([dict(r) for r in rows])
 
 
 @app.post("/api/events")
 def create_event():
     body = request.get_json(silent=True) or {}
-    # TODO FI: tarkista kentät artist_id, stage_id, day_id, start_dt → puuttuu = 400.
-    #          Lisää rivi Event-tauluun (event_type 'performance', kesto esim. 45 min).
-    #          sqlite3.IntegrityError (esim. olematon artist_id) → 400 ja selkeä virheviesti.
-    #          Onnistuminen → 201 ja uuden rivin tiedot JSONina (sis. event_id).
-    # TODO EN: validate artist_id, stage_id, day_id, start_dt → missing = 400.
-    #          Insert into Event (event_type 'performance', duration e.g. 45 min).
-    #          sqlite3.IntegrityError (e.g. unknown artist_id) → 400 with a clear message.
-    #          Success → 201 with the new row as JSON (incl. event_id).
-    return jsonify(error="not implemented"), 501
+
+    # Pakolliset kentät
+    required = ["artist_id", "stage_id", "day_id", "start_dt"]
+    missing = [k for k in required if k not in body or body[k] is None]
+    if missing:
+        return jsonify(error=f"Missing fields: {', '.join(missing)}"), 400
+
+    artist_id = body["artist_id"]
+    stage_id = body["stage_id"]
+    day_id = body["day_id"]
+    start_dt = str(body["start_dt"])
+
+    # start_dt-muoto YYYY-MM-DD HH:MM:SS
+    if not re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", start_dt):
+        return jsonify(error="start_dt must be in format YYYY-MM-DD HH:MM:SS"), 400
+
+    try:
+        start = datetime.strptime(start_dt, "%Y-%m-%d %H:%M:%S")
+        end = start + timedelta(minutes=45)
+        # Kannassa on start_time / end_time muodossa HH:MM tai HH:MM:SS
+        start_time = start.strftime("%H:%M:%S")
+        end_time = end.strftime("%H:%M:%S")
+    except ValueError:
+        return jsonify(error="Invalid start_dt value"), 400
+
+    # event_type_id = 1 (Concert) – lähin vastine 'performance':lle
+    event_type_id = 1
+
+    conn = get_db()
+    try:
+        cur = conn.execute("""
+            INSERT INTO Event (artist_id, stage_id, day_id, event_type_id, start_time, end_time)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (artist_id, stage_id, day_id, event_type_id, start_time, end_time))
+        conn.commit()
+        event_id = cur.lastrowid
+
+        row = conn.execute(
+            "SELECT * FROM Event WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        conn.close()
+        return jsonify(dict(row)), 201
+    except sqlite3.IntegrityError as e:
+        conn.close()
+        return jsonify(error=f"Integrity error: {str(e)}"), 400
 
 
 @app.delete("/api/events/<int:event_id>")
 def delete_event(event_id):
-    # TODO FI: poista esiintyminen. Onnistuminen → 204 (tyhjä runko), tuntematon id → 404.
-    # TODO EN: delete the event. Success → 204 (empty body), unknown id → 404.
-    return jsonify(error="not implemented"), 501
+    conn = get_db()
+    cur = conn.execute("DELETE FROM Event WHERE event_id = ?", (event_id,))
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
 
+    if deleted == 0:
+        return jsonify(error="Event not found"), 404
+    return "", 204   # tyhjä runko + 204 No Content
+
+
+if __name__ == "__main__":
+    # FI: Paikallinen kehityspalvelin. Rahdissa sovellusta ajaa gunicorn (ks. Dockerfile).
+    # EN: Local dev server. On Rahti the app is run by gunicorn (see Dockerfile).
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=True)
 
 if __name__ == "__main__":
     # FI: Paikallinen kehityspalvelin. Rahdissa sovellusta ajaa gunicorn (ks. Dockerfile).
